@@ -1,0 +1,39 @@
+[package]
+name = "zkimg"
+version = "0.1.0"
+edition = "2021"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[dependencies]
+itertools = "0.10"
+rand = "=0.8"
+num-bigint={ version="0.4", features=["rand"] }
+num-integer = "=0.1"
+serde = { version = "=1.0", default-features = false, features = ["derive"] }
+serde_json = "=1.0"
+log = "=0.4"
+env_logger = "=0.10"
+
+# halo2
+halo2_proofs = { git = "https://github.com/privacy-scaling-explorations/halo2.git", tag = "v2023_02_02" }
+
+# Axiom's helper API with basic functions 
+halo2-base = { git = "https://github.com/axiom-crypto/halo2-lib", tag = "v0.3.0-ce" }
+halo2-ecc = {default-features = false, features = [
+    "halo2-axiom",
+    "display",
+], git = "https://github.com/axiom-crypto/halo2-lib.git", tag="v0.3.0-ce"}
+get-size = "0.1.4"
+
+[dev-dependencies]
+criterion= { version = "0.4.0", features = ["html_reports"] }
+criterion-macro="0.4"
+
+[[bench]]
+name = "crop"
+harness = false
+
+[[bench]]
+name = "schnorr"
+harness = false
