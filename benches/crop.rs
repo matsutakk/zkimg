@@ -61,7 +61,6 @@ fn crop<F: ScalarField>(
     let chip = GateChip::default();
     
     // let mut constraints = vec![];
-    
     // let mut is_eq = ctx.load(F::one());
     for new_y in 0..crop_height {
         for new_x in 0..crop_width {
@@ -83,24 +82,15 @@ fn crop<F: ScalarField>(
                     &original_witness[old_index+rgb],
                     &cropped_image[new_index+rgb],
                 );
-                
-                
-                // constraints.push(c.clone());
-                // flag = chip.and(ctx, c, flag);
             }
         }
     }
-
-    // let mut res: AssignedValue<F> = chip.and(ctx, constraints[0], constraints[1]);
-    // for i in 2..constraints.len() {
-    //     res = chip.and(ctx, res, constraints[i]);
-    // }
-    // chip.assert_is_const(ctx, &res, &F::from(1));
 }
 
-const k:u32 = 18;
-
 fn crop_circuit(
+    k: usize,
+    img: &Vec<u64>,
+    cropped: &Vec<u64>,
     stage: CircuitBuilderStage,
     break_points: Option<MultiPhaseThreadBreakPoints>,
 ) -> RangeCircuitBuilder<Fr> {
@@ -109,9 +99,6 @@ fn crop_circuit(
         CircuitBuilderStage::Prover => GateThreadBuilder::prover(),
         CircuitBuilderStage::Keygen => GateThreadBuilder::keygen(),
     };
-
-    let img = generate_image(WIDTH, HEIGHT);
-    let cropped = crop_image(&img, WIDTH, STARTX, STARTY, CROPWIDTH, CROPHEIGHT);
 
     crop(
         builder.main(0), 
@@ -138,25 +125,10 @@ fn crop_circuit(
 }
 
 fn bench(c: &mut Criterion) {
-    // let img = generate_image(WIDTH, HEIGHT);
-    // let cropped = crop_image(&img, WIDTH, STARTX, STARTY, CROPWIDTH, CROPHEIGHT);
-
-    // let mut builder = GateThreadBuilder::new(false);
-    // crop(
-    //     builder.main(0), 
-    //     img.iter().map(|&x| Fr::from(x)).collect(),
-    //     cropped.iter().map(|&x| Fr::from(x)).collect(),
-    //     STARTX, 
-    //     STARTY,
-    //     CROPWIDTH,
-    //     CROPHEIGHT
-    // );
-    // builder.config(k as usize, None);
-    // let circuit = GateCircuitBuilder::mock(builder);
-
-    // // check the circuit is correct just in case
-    // MockProver::run(k, &circuit, vec![]).unwrap().assert_satisfied();
-    let circuit = crop_circuit(CircuitBuilderStage::Keygen, None);
+    let k:u32 = 20;
+    let img = generate_image(WIDTH, HEIGHT);
+    let cropped = crop_image(&img, WIDTH, STARTX, STARTY, CROPWIDTH, CROPHEIGHT);
+    let circuit = crop_circuit(k as usize, &img, &cropped, CircuitBuilderStage::Keygen, None);
     let params = ParamsKZG::<Bn256>::setup(k, OsRng);
     let vk: VerifyingKey<G1Affine> = keygen_vk(&params, &circuit).expect("vk should not fail");
     let pk = keygen_pk(&params, vk, &circuit).expect("pk should not fail");
@@ -164,16 +136,57 @@ fn bench(c: &mut Criterion) {
     println!("{:?}",break_points);
     drop(circuit);
 
+    let mut builder = GateThreadBuilder::new(true);
+    crop(
+        builder.main(0), 
+        img.iter().map(|&x| Fr::from(x)).collect(),
+        cropped.iter().map(|&x| Fr::from(x)).collect(),
+        STARTX, 
+        STARTY,
+        CROPWIDTH,
+        CROPHEIGHT
+    );
+    let circuit = RangeCircuitBuilder::prover(builder, break_points.clone());
+
+    let mut transcript: Blake2bWrite<Vec<u8>, G1Affine, Challenge255<G1Affine>> = Blake2bWrite::<_, _, Challenge255<_>>::init(vec![]);
+    create_proof::<
+        KZGCommitmentScheme<Bn256>,
+        ProverSHPLONK<'_, Bn256>,
+        Challenge255<G1Affine>,
+        _,
+        Blake2bWrite<Vec<u8>, G1Affine, Challenge255<_>>,
+        _,
+    >(&params, &pk, &[circuit], &[&[]], OsRng, &mut transcript)
+    .expect("prover should not fail");
+
+    let proof = transcript.finalize();
+    println!("{:?}",proof.len());
+
+
+    let mut keygen_group = c.benchmark_group("zkimg");
+    keygen_group.sample_size(10);
+    keygen_group.bench_with_input(
+        BenchmarkId::new("crop-keygen", k),
+        &(&k, &img, &cropped),
+        |bencher, &(k, img, cropped)| {
+            bencher.iter(|| {
+                let circuit = crop_circuit(*k as usize, &img, &cropped, CircuitBuilderStage::Keygen, None);
+                let params = ParamsKZG::<Bn256>::setup(*k, OsRng);
+                let vk: VerifyingKey<G1Affine> = keygen_vk(&params, &circuit).expect("vk should not fail");
+                let pk = keygen_pk(&params, vk, &circuit).expect("pk should not fail");
+            })
+        },
+    );
+    keygen_group.finish();
+
     let mut group = c.benchmark_group("zkimg");
     group.sample_size(10);
     group.bench_with_input(
-        BenchmarkId::new("crop", k),
-        &(&params, &pk),
-        |bencher, &(params, pk)| {
+        BenchmarkId::new("crop-proof", k),
+        &(&params, &pk, &img, &cropped),
+        |bencher, &(params, pk, img, cropped)| {
             bencher.iter(|| {
                 let mut builder = GateThreadBuilder::new(true);
-                let img = generate_image(WIDTH, HEIGHT);
-                let cropped = crop_image(&img,WIDTH, STARTX, STARTY, CROPWIDTH, CROPHEIGHT);
                 crop(
                     builder.main(0), 
                     img.iter().map(|&x| Fr::from(x)).collect(),
@@ -195,16 +208,16 @@ fn bench(c: &mut Criterion) {
                     _,
                 >(params, pk, &[circuit], &[&[]], OsRng, &mut transcript)
                 .expect("prover should not fail");
-
-                println!("aaaaaaaaaaaa");
-
                 let proof = transcript.finalize();
-                println!("{:?}",proof.len());
-
+            })
+        },
+    );
+    group.bench_with_input(
+        BenchmarkId::new("crop-verify", k),
+        &(&params, &pk, &proof),
+        |bencher, &(params, pk, proof)| {
+            bencher.iter(|| {
                 let mut transcripts: Blake2bRead<&[u8], G1Affine, Challenge255<G1Affine>> = Blake2bRead::<_, _, Challenge255<_>>::init(&proof[..]);
-
-                println!("bbbbbbbbbbbb");
-
                 let strategy = SingleStrategy::new(params);
                 let res = verify_proof::<
                     KZGCommitmentScheme<Bn256>,
@@ -212,11 +225,7 @@ fn bench(c: &mut Criterion) {
                     Challenge255<G1Affine>,
                     Blake2bRead<&[u8], G1Affine, Challenge255<G1Affine>>,
                     SingleStrategy<'_, Bn256>,
-                >(params, &pk.get_vk(), strategy, &[], &mut transcripts);
-
-                println!("cccccccccccccc");
-
-
+                >(params, &pk.get_vk(), strategy, &[&[]], &mut transcripts);
                 if res.is_err() {
                     println!("{:?}",res);
                 }
@@ -224,8 +233,6 @@ fn bench(c: &mut Criterion) {
         },
     );
     group.finish();
-
-
 }
 
 criterion_group! {

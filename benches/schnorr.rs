@@ -12,9 +12,9 @@ use halo2_base::{
         plonk::*,
         poly::kzg::{
             commitment::{KZGCommitmentScheme, ParamsKZG},
-            multiopen::ProverSHPLONK,
+            multiopen::{ProverSHPLONK, VerifierSHPLONK}, strategy::SingleStrategy,
         },
-        transcript::{Blake2bWrite, Challenge255, TranscriptWriterBuffer},
+        transcript::{Blake2bWrite, Challenge255, TranscriptWriterBuffer, Blake2bRead, TranscriptReadBuffer},
     },
     Context, utils::{BigPrimeField, CurveAffineExt}, AssignedValue,
 };
@@ -30,7 +30,7 @@ use criterion::{BenchmarkId, Criterion};
 use zkimg::util::{random_schnorr_signature_input, SchnorrInput};
 
 
-const K: usize = 10;
+const K: usize = 13;
 
 pub fn schnorr_verify_no_pubkey_check<F: PrimeField, CF: PrimeField, SF: PrimeField, GA>(
     chip: &EccChip<F, FpChipField<F, CF>>,
@@ -163,17 +163,46 @@ fn schnorr_circuit(
 }
 
 fn bench(c: &mut Criterion) {
+    let k:u32 = K as u32;
     let circuit = schnorr_circuit(CircuitBuilderStage::Keygen, None);
-
     let params = ParamsKZG::<Bn256>::setup(K as u32, OsRng);
     let vk = keygen_vk(&params, &circuit).expect("vk should not fail");
     let pk = keygen_pk(&params, vk, &circuit).expect("pk should not fail");
     let break_points = circuit.0.break_points.take();
+    drop(circuit);
+
+    let circuit = schnorr_circuit(CircuitBuilderStage::Prover, Some(break_points.clone()));
+
+    let mut transcript = Blake2bWrite::<_, _, Challenge255<_>>::init(vec![]);
+    create_proof::<
+        KZGCommitmentScheme<Bn256>,
+        ProverSHPLONK<'_, Bn256>,
+        Challenge255<G1Affine>,
+        _,
+        Blake2bWrite<Vec<u8>, G1Affine, Challenge255<_>>,
+        _,
+    >(&params, &pk, &[circuit], &[&[]], OsRng, &mut transcript)
+    .expect("prover should not fail");
+    let proof = transcript.finalize();    
+    println!("{:?}",proof.len());
 
     let mut group = c.benchmark_group("schnorr");
     group.sample_size(10);
     group.bench_with_input(
-        BenchmarkId::new("schnorr", K),
+        BenchmarkId::new("schnorr-keygen", k),
+        &(&k),
+        |bencher, &(k)| {
+            bencher.iter(|| {
+                let circuit = schnorr_circuit(CircuitBuilderStage::Keygen, None);
+                let params = ParamsKZG::<Bn256>::setup(*k, OsRng);
+                let vk: VerifyingKey<G1Affine> = keygen_vk(&params, &circuit).expect("vk should not fail");
+                let pk = keygen_pk(&params, vk, &circuit).expect("pk should not fail");
+            })
+        },
+    );
+
+    group.bench_with_input(
+        BenchmarkId::new("schnorr-proof", K),
         &(&params, &pk),
         |bencher, &(params, pk)| {
             bencher.iter(|| {
@@ -190,10 +219,32 @@ fn bench(c: &mut Criterion) {
                     _,
                 >(params, pk, &[circuit], &[&[]], OsRng, &mut transcript)
                 .expect("prover should not fail");
+                transcript.finalize();
             })
         },
     );
-    group.finish()
+
+    group.bench_with_input(
+        BenchmarkId::new("schnorr-verify", k),
+        &(&params, &pk, &proof),
+        |bencher, &(params, pk, proof)| {
+            bencher.iter(|| {
+                let mut transcripts: Blake2bRead<&[u8], G1Affine, Challenge255<G1Affine>> = Blake2bRead::<_, _, Challenge255<_>>::init(&proof[..]);
+                let strategy = SingleStrategy::new(params);
+                let res = verify_proof::<
+                    KZGCommitmentScheme<Bn256>,
+                    VerifierSHPLONK<'_, Bn256>,
+                    Challenge255<G1Affine>,
+                    Blake2bRead<&[u8], G1Affine, Challenge255<G1Affine>>,
+                    SingleStrategy<'_, Bn256>,
+                >(params, &pk.get_vk(), strategy, &[&[]], &mut transcripts);
+                if res.is_err() {
+                    println!("{:?}",res);
+                }
+            })
+        },
+    );
+    group.finish();
 }
 
 criterion_group! {
